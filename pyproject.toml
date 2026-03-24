@@ -61,6 +61,10 @@ dependencies = [
 [project.optional-dependencies]
 full = ["akqmt"]
 qmt = ["akqmt"]
+realtime = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+]
 dev = [
     "akqmt>=0.1.0",
     "commitizen>=4.12.1; python_version >= '3.10'",

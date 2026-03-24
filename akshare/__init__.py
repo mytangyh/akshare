@@ -5872,6 +5872,17 @@ from akshare.fund.fund_xq import (
 )
 
 """
+服务模块
+"""
+from akshare.service import (
+    AStockQuoteSubscriptionService,
+    QuoteSnapshot,
+    QuoteSubscription,
+    create_quote_websocket_app,
+    run_quote_websocket_app,
+)
+
+"""
 异常处理模块
 """
 from .exceptions import (
