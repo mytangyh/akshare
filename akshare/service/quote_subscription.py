@@ -8,6 +8,9 @@ Desc: A 股实时行情订阅服务
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable
@@ -18,6 +21,18 @@ import requests
 
 QuoteFetcher = Callable[[str], pd.DataFrame]
 QuoteBatchFetcher = Callable[[list[str]], dict[str, pd.DataFrame]]
+LOGGER = logging.getLogger(__name__)
+
+if not LOGGER.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    )
+    LOGGER.addHandler(_handler)
+    LOGGER.propagate = False
+LOGGER.setLevel(
+    getattr(logging, os.getenv("QUOTE_LOG_LEVEL", "INFO").upper(), logging.INFO)
+)
 
 
 @dataclass(frozen=True)
@@ -187,6 +202,7 @@ class AStockQuoteSubscriptionService:
         normalized_symbol = self._normalize_symbol(symbol)
         subscription_id = uuid4().hex
         queue: asyncio.Queue[QuoteSnapshot] = asyncio.Queue(maxsize=max_queue_size)
+        poller_started = False
 
         async with self._lock:
             symbol_subscribers = self._subscribers_by_symbol.setdefault(
@@ -199,9 +215,31 @@ class AStockQuoteSubscriptionService:
                 self._poll_task = asyncio.create_task(
                     self._poll_loop(), name="akshare-quote-poller"
                 )
+                poller_started = True
+            symbol_subscription_size = len(symbol_subscribers)
+            total_subscriptions = len(self._subscription_index)
+            active_symbol_size = len(self._subscribers_by_symbol)
+
+        if poller_started:
+            LOGGER.info(
+                "quote poller started poll_interval=%s batch_size=%s fallback_fetchers=%s",
+                self._base_poll_interval,
+                self._batch_size,
+                len(self._fallback_fetchers),
+            )
 
         if latest_snapshot is not None:
             self._offer_snapshot(queue, latest_snapshot)
+
+        LOGGER.info(
+            "quote subscribed symbol=%s subscription_id=%s symbol_subscriptions=%s total_subscriptions=%s active_symbols=%s cached_snapshot=%s",
+            normalized_symbol,
+            subscription_id,
+            symbol_subscription_size,
+            total_subscriptions,
+            active_symbol_size,
+            latest_snapshot is not None,
+        )
 
         return QuoteSubscription(
             subscription_id=subscription_id,
@@ -215,10 +253,18 @@ class AStockQuoteSubscriptionService:
         """
 
         task_to_cancel: asyncio.Task[None] | None = None
+        removed_symbol: str | None = None
+        symbol_subscription_size = 0
+        total_subscriptions = 0
+        active_symbol_size = 0
 
         async with self._lock:
             symbol = self._subscription_index.pop(subscription_id, None)
             if symbol is None:
+                LOGGER.info(
+                    "quote unsubscribe ignored subscription_id=%s removed=False",
+                    subscription_id,
+                )
                 return False
 
             symbol_subscribers = self._subscribers_by_symbol.get(symbol)
@@ -229,14 +275,31 @@ class AStockQuoteSubscriptionService:
                     self._latest_snapshots.pop(symbol, None)
                     self._last_fingerprints.pop(symbol, None)
                     self._latest_errors.pop(symbol, None)
+                    symbol_subscription_size = 0
+                else:
+                    symbol_subscription_size = len(symbol_subscribers)
 
             if not self._subscribers_by_symbol and self._poll_task is not None:
                 task_to_cancel = self._poll_task
                 self._poll_task = None
 
+            removed_symbol = symbol
+            total_subscriptions = len(self._subscription_index)
+            active_symbol_size = len(self._subscribers_by_symbol)
+
         if task_to_cancel is not None:
             task_to_cancel.cancel()
             await asyncio.gather(task_to_cancel, return_exceptions=True)
+            LOGGER.info("quote poller stopped reason=no_active_subscriptions")
+
+        LOGGER.info(
+            "quote unsubscribed symbol=%s subscription_id=%s removed=True symbol_subscriptions=%s total_subscriptions=%s active_symbols=%s",
+            removed_symbol,
+            subscription_id,
+            symbol_subscription_size,
+            total_subscriptions,
+            active_symbol_size,
+        )
         return True
 
     async def stream(
@@ -260,6 +323,8 @@ class AStockQuoteSubscriptionService:
         停止全部轮询任务并清空订阅
         """
 
+        total_subscriptions = self.subscription_size
+        active_symbol_size = len(self.active_symbols)
         async with self._lock:
             task = self._poll_task
             self._poll_task = None
@@ -274,8 +339,15 @@ class AStockQuoteSubscriptionService:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
+        LOGGER.info(
+            "quote service stopped cleared_subscriptions=%s cleared_symbols=%s",
+            total_subscriptions,
+            active_symbol_size,
+        )
+
     async def _poll_loop(self) -> None:
         failure_streak = 0
+        LOGGER.info("quote polling loop entered")
         try:
             while True:
                 async with self._lock:
@@ -287,6 +359,8 @@ class AStockQuoteSubscriptionService:
                 publish_list: list[
                     tuple[list[asyncio.Queue[QuoteSnapshot]], QuoteSnapshot]
                 ] = []
+                duplicate_count = 0
+                publish_target_count = 0
 
                 async with self._lock:
                     for symbol, error in errors.items():
@@ -309,16 +383,18 @@ class AStockQuoteSubscriptionService:
                             self._last_fingerprints[symbol] = current_fingerprint
 
                         if should_publish:
+                            subscriber_queues = list(
+                                self._subscribers_by_symbol.get(symbol, {}).values()
+                            )
                             publish_list.append(
                                 (
-                                    list(
-                                        self._subscribers_by_symbol.get(
-                                            symbol, {}
-                                        ).values()
-                                    ),
+                                    subscriber_queues,
                                     snapshot,
                                 )
                             )
+                            publish_target_count += len(subscriber_queues)
+                        else:
+                            duplicate_count += 1
 
                 for queues, snapshot in publish_list:
                     for queue in queues:
@@ -333,13 +409,26 @@ class AStockQuoteSubscriptionService:
                     self._base_poll_interval * (2**failure_streak),
                     self._max_backoff,
                 )
+                LOGGER.info(
+                    "quote polling round completed symbols=%s snapshots=%s errors=%s publish_events=%s publish_targets=%s duplicate_skips=%s next_interval=%s failure_streak=%s",
+                    len(symbols),
+                    len(snapshots),
+                    len(errors),
+                    len(publish_list),
+                    publish_target_count,
+                    duplicate_count,
+                    self._current_poll_interval,
+                    failure_streak,
+                )
                 await asyncio.sleep(self._current_poll_interval)
         except asyncio.CancelledError:
+            LOGGER.info("quote polling loop cancelled")
             raise
         finally:
             async with self._lock:
                 if self._poll_task is asyncio.current_task():
                     self._poll_task = None
+            LOGGER.info("quote polling loop exited")
 
     async def _fetch_snapshots(
         self, symbols: list[str]
@@ -348,12 +437,21 @@ class AStockQuoteSubscriptionService:
         errors: dict[str, Exception] = {}
 
         for symbol_chunk in self._chunk_symbols(symbols):
+            started_at = time.perf_counter()
             try:
                 batch_result = await asyncio.to_thread(self._batch_fetcher, symbol_chunk)
             except Exception as err:
+                elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+                LOGGER.warning(
+                    "quote batch fetch failed symbols=%s elapsed_ms=%s error=%s",
+                    ",".join(symbol_chunk),
+                    elapsed_ms,
+                    err,
+                )
                 for symbol in symbol_chunk:
                     errors[symbol] = err
             else:
+                elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
                 for symbol, quote_df in batch_result.items():
                     normalized_symbol = self._normalize_symbol(symbol)
                     if (
@@ -362,11 +460,22 @@ class AStockQuoteSubscriptionService:
                         and not quote_df.empty
                     ):
                         quote_frames[normalized_symbol] = quote_df
+                LOGGER.info(
+                    "quote batch fetch completed symbols=%s resolved=%s elapsed_ms=%s",
+                    len(symbol_chunk),
+                    sum(1 for symbol in symbol_chunk if symbol in quote_frames),
+                    elapsed_ms,
+                )
 
         unresolved_symbols = [
             symbol for symbol in symbols if symbol not in quote_frames
         ]
         if unresolved_symbols and self._fallback_fetchers:
+            LOGGER.warning(
+                "quote batch fetch unresolved symbols=%s fallback_fetchers=%s",
+                ",".join(unresolved_symbols),
+                len(self._fallback_fetchers),
+            )
             fallback_frames, fallback_errors = await self._fetch_from_fallbacks(
                 unresolved_symbols
             )
@@ -380,6 +489,11 @@ class AStockQuoteSubscriptionService:
             try:
                 snapshots[symbol] = self._build_snapshot(symbol=symbol, quote_df=quote_df)
             except Exception as err:
+                LOGGER.warning(
+                    "quote snapshot build failed symbol=%s error=%s",
+                    symbol,
+                    err,
+                )
                 errors[symbol] = err
         return snapshots, errors
 
@@ -394,14 +508,31 @@ class AStockQuoteSubscriptionService:
             last_error: Exception | None = None
             async with semaphore:
                 for fetcher in self._fallback_fetchers:
+                    fetcher_name = self._fetcher_name(fetcher)
                     try:
                         quote_df = await asyncio.to_thread(fetcher, symbol)
                     except Exception as err:  # noqa: PERF203
                         last_error = err
+                        LOGGER.warning(
+                            "quote fallback fetch failed symbol=%s source=%s error=%s",
+                            symbol,
+                            fetcher_name,
+                            err,
+                        )
                         continue
                     if quote_df is not None and not quote_df.empty:
+                        LOGGER.info(
+                            "quote fallback fetch succeeded symbol=%s source=%s",
+                            symbol,
+                            fetcher_name,
+                        )
                         return symbol, quote_df, None
                     last_error = ValueError("empty quote data")
+                    LOGGER.warning(
+                        "quote fallback fetch empty symbol=%s source=%s",
+                        symbol,
+                        fetcher_name,
+                    )
             return symbol, None, last_error or ValueError("no quote data")
 
         results = await asyncio.gather(
@@ -427,6 +558,10 @@ class AStockQuoteSubscriptionService:
             return {symbol: fetcher(symbol) for symbol in symbols}
 
         return inner
+
+    @staticmethod
+    def _fetcher_name(fetcher: QuoteFetcher) -> str:
+        return getattr(fetcher, "__name__", fetcher.__class__.__name__)
 
     @staticmethod
     def _eastmoney_single_fetch(symbol: str) -> pd.DataFrame:

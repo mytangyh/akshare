@@ -8,10 +8,26 @@ Desc: A 股实时行情 WebSocket 接口
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from contextlib import asynccontextmanager, suppress
 from typing import Any
+from uuid import uuid4
 
 from .quote_subscription import AStockQuoteSubscriptionService, QuoteSnapshot
+
+LOGGER = logging.getLogger(__name__)
+
+if not LOGGER.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    )
+    LOGGER.addHandler(_handler)
+    LOGGER.propagate = False
+LOGGER.setLevel(
+    getattr(logging, os.getenv("QUOTE_LOG_LEVEL", "INFO").upper(), logging.INFO)
+)
 
 
 def create_quote_websocket_app(
@@ -30,10 +46,16 @@ def create_quote_websocket_app(
 
     @asynccontextmanager
     async def lifespan(app):
+        LOGGER.info(
+            "quote websocket app started poll_interval=%s",
+            quote_service.current_poll_interval,
+        )
         try:
             yield
         finally:
+            LOGGER.info("quote websocket app stopping")
             await quote_service.stop()
+            LOGGER.info("quote websocket app stopped")
 
     app = FastAPI(
         title="AKShare A-Stock Quote WebSocket",
@@ -52,10 +74,22 @@ def create_quote_websocket_app(
 
     @app.websocket("/ws/quotes")
     async def quotes_websocket(websocket: WebSocket) -> None:
+        connection_id = uuid4().hex[:8]
+        client = _client_repr(websocket)
         await websocket.accept()
+        LOGGER.info(
+            "websocket connected connection_id=%s client=%s",
+            connection_id,
+            client,
+        )
         outgoing_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         sender_task = asyncio.create_task(
-            _sender_loop(websocket=websocket, outgoing_queue=outgoing_queue)
+            _sender_loop(
+                websocket=websocket,
+                outgoing_queue=outgoing_queue,
+                connection_id=connection_id,
+                client=client,
+            )
         )
         subscriptions_by_symbol: dict[str, Any] = {}
         forwarders_by_symbol: dict[str, asyncio.Task[None]] = {}
@@ -63,65 +97,136 @@ def create_quote_websocket_app(
         try:
             while True:
                 payload = await websocket.receive_json()
-                action = str(payload.get("action", "")).strip().lower()
+                LOGGER.info(
+                    "websocket request received connection_id=%s client=%s payload=%s",
+                    connection_id,
+                    client,
+                    _summarize_payload(payload),
+                )
+                try:
+                    action = str(payload.get("action", "")).strip().lower()
 
-                if action == "subscribe":
-                    symbol = payload.get("symbol")
-                    normalized_symbol = quote_service._normalize_symbol(symbol)
+                    if action == "subscribe":
+                        symbol = payload.get("symbol")
+                        normalized_symbol = quote_service._normalize_symbol(symbol)
 
-                    current_subscription = subscriptions_by_symbol.get(normalized_symbol)
-                    if current_subscription is not None:
+                        current_subscription = subscriptions_by_symbol.get(
+                            normalized_symbol
+                        )
+                        if current_subscription is not None:
+                            LOGGER.info(
+                                "websocket subscribe reused connection_id=%s client=%s symbol=%s subscription_id=%s",
+                                connection_id,
+                                client,
+                                normalized_symbol,
+                                current_subscription.subscription_id,
+                            )
+                            await outgoing_queue.put(
+                                {
+                                    "type": "subscribed",
+                                    "symbol": normalized_symbol,
+                                    "subscription_id": current_subscription.subscription_id,
+                                    "reused": True,
+                                }
+                            )
+                            continue
+
+                        subscription = await quote_service.subscribe(normalized_symbol)
+                        subscriptions_by_symbol[normalized_symbol] = subscription
+                        LOGGER.info(
+                            "websocket subscribed connection_id=%s client=%s symbol=%s subscription_id=%s active_connection_subscriptions=%s",
+                            connection_id,
+                            client,
+                            normalized_symbol,
+                            subscription.subscription_id,
+                            len(subscriptions_by_symbol),
+                        )
                         await outgoing_queue.put(
                             {
                                 "type": "subscribed",
                                 "symbol": normalized_symbol,
-                                "subscription_id": current_subscription.subscription_id,
-                                "reused": True,
+                                "subscription_id": subscription.subscription_id,
+                                "reused": False,
                             }
+                        )
+                        forwarders_by_symbol[normalized_symbol] = asyncio.create_task(
+                            _forward_subscription(
+                                subscription=subscription,
+                                outgoing_queue=outgoing_queue,
+                            )
                         )
                         continue
 
-                    subscription = await quote_service.subscribe(normalized_symbol)
-                    subscriptions_by_symbol[normalized_symbol] = subscription
+                    if action == "unsubscribe":
+                        result = await _unsubscribe_by_payload(
+                            payload=payload,
+                            quote_service=quote_service,
+                            subscriptions_by_symbol=subscriptions_by_symbol,
+                            forwarders_by_symbol=forwarders_by_symbol,
+                        )
+                        LOGGER.info(
+                            "websocket unsubscribed connection_id=%s client=%s symbol=%s subscription_id=%s removed=%s active_connection_subscriptions=%s",
+                            connection_id,
+                            client,
+                            result.get("symbol"),
+                            result.get("subscription_id"),
+                            result.get("removed"),
+                            len(subscriptions_by_symbol),
+                        )
+                        await outgoing_queue.put(result)
+                        continue
+
+                    if action == "ping":
+                        LOGGER.info(
+                            "websocket ping connection_id=%s client=%s",
+                            connection_id,
+                            client,
+                        )
+                        await outgoing_queue.put({"type": "pong"})
+                        continue
+
+                    LOGGER.warning(
+                        "websocket unsupported action connection_id=%s client=%s action=%s",
+                        connection_id,
+                        client,
+                        action,
+                    )
                     await outgoing_queue.put(
                         {
-                            "type": "subscribed",
-                            "symbol": normalized_symbol,
-                            "subscription_id": subscription.subscription_id,
-                            "reused": False,
+                            "type": "error",
+                            "message": "unsupported action",
+                            "supported_actions": ["subscribe", "unsubscribe", "ping"],
                         }
                     )
-                    forwarders_by_symbol[normalized_symbol] = asyncio.create_task(
-                        _forward_subscription(
-                            subscription=subscription,
-                            outgoing_queue=outgoing_queue,
-                        )
+                except ValueError as err:
+                    LOGGER.warning(
+                        "websocket request rejected connection_id=%s client=%s error=%s payload=%s",
+                        connection_id,
+                        client,
+                        err,
+                        _summarize_payload(payload),
                     )
-                    continue
-
-                if action == "unsubscribe":
-                    result = await _unsubscribe_by_payload(
-                        payload=payload,
-                        quote_service=quote_service,
-                        subscriptions_by_symbol=subscriptions_by_symbol,
-                        forwarders_by_symbol=forwarders_by_symbol,
+                    await outgoing_queue.put({"type": "error", "message": str(err)})
+                except Exception:
+                    LOGGER.exception(
+                        "websocket request failed connection_id=%s client=%s payload=%s",
+                        connection_id,
+                        client,
+                        _summarize_payload(payload),
                     )
-                    await outgoing_queue.put(result)
-                    continue
-
-                if action == "ping":
-                    await outgoing_queue.put({"type": "pong"})
-                    continue
-
-                await outgoing_queue.put(
-                    {
-                        "type": "error",
-                        "message": "unsupported action",
-                        "supported_actions": ["subscribe", "unsubscribe", "ping"],
-                    }
-                )
+                    await outgoing_queue.put(
+                        {
+                            "type": "error",
+                            "message": "internal server error",
+                        }
+                    )
         except WebSocketDisconnect:
-            pass
+            LOGGER.info(
+                "websocket disconnected connection_id=%s client=%s active_connection_subscriptions=%s",
+                connection_id,
+                client,
+                len(subscriptions_by_symbol),
+            )
         finally:
             sender_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -135,6 +240,11 @@ def create_quote_websocket_app(
                     subscriptions_by_symbol=subscriptions_by_symbol,
                     forwarders_by_symbol=forwarders_by_symbol,
                 )
+            LOGGER.info(
+                "websocket cleanup completed connection_id=%s client=%s",
+                connection_id,
+                client,
+            )
 
     return app
 
@@ -159,6 +269,12 @@ def run_quote_websocket_app(
     app = create_quote_websocket_app(
         service=service,
         poll_interval=poll_interval,
+    )
+    LOGGER.info(
+        "quote websocket app boot host=%s port=%s poll_interval=%s",
+        host,
+        port,
+        poll_interval,
     )
     uvicorn.run(app, host=host, port=port)
 
@@ -247,12 +363,29 @@ async def _forward_subscription(
         raise
 
 
-async def _sender_loop(websocket, outgoing_queue: asyncio.Queue[dict[str, Any]]) -> None:
+async def _sender_loop(
+    websocket,
+    outgoing_queue: asyncio.Queue[dict[str, Any]],
+    connection_id: str,
+    client: str,
+) -> None:
     try:
         while True:
             message = await outgoing_queue.get()
             await websocket.send_json(message)
+            _log_outgoing_message(
+                connection_id=connection_id,
+                client=client,
+                message=message,
+            )
     except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOGGER.exception(
+            "websocket sender failed connection_id=%s client=%s",
+            connection_id,
+            client,
+        )
         raise
 
 
@@ -274,6 +407,56 @@ def _snapshot_to_dict(snapshot: QuoteSnapshot) -> dict[str, Any]:
         "captured_at": snapshot.captured_at.isoformat(),
         "raw": snapshot.raw,
     }
+
+
+def _client_repr(websocket) -> str:
+    client = getattr(websocket, "client", None)
+    if client is None:
+        return "unknown"
+    host = getattr(client, "host", None) or "unknown"
+    port = getattr(client, "port", None)
+    if port is None:
+        return str(host)
+    return f"{host}:{port}"
+
+
+def _summarize_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action": payload.get("action"),
+        "symbol": payload.get("symbol"),
+        "subscription_id": payload.get("subscription_id"),
+    }
+
+
+def _log_outgoing_message(
+    connection_id: str,
+    client: str,
+    message: dict[str, Any],
+) -> None:
+    message_type = message.get("type")
+    if message_type == "quote":
+        data = message.get("data", {})
+        LOGGER.info(
+            "websocket message sent connection_id=%s client=%s type=%s symbol=%s subscription_id=%s price=%s change_pct=%s source_time=%s",
+            connection_id,
+            client,
+            message_type,
+            message.get("symbol"),
+            message.get("subscription_id"),
+            data.get("price"),
+            data.get("change_pct"),
+            data.get("source_time"),
+        )
+        return
+
+    LOGGER.info(
+        "websocket message sent connection_id=%s client=%s type=%s symbol=%s subscription_id=%s",
+        connection_id,
+        client,
+        message_type,
+        message.get("symbol"),
+        message.get("subscription_id"),
+    )
 
 
 def _load_fastapi():
