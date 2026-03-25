@@ -67,27 +67,32 @@ def _create_default_quote_service(
         access_token = os.getenv("IFIND_ACCESS_TOKEN", "").strip()
         refresh_token = os.getenv("IFIND_REFRESH_TOKEN", "").strip()
         raw_timeout = os.getenv("IFIND_REQUEST_TIMEOUT", "10")
+        raw_skip_off_hours = os.getenv("IFIND_SKIP_OFF_HOURS_REQUESTS", "1").strip()
         try:
             request_timeout = float(raw_timeout)
         except ValueError as err:
             raise ValueError("IFIND_REQUEST_TIMEOUT 必须是数字") from err
         if request_timeout <= 0:
             raise ValueError("IFIND_REQUEST_TIMEOUT 必须大于 0")
+        skip_off_hours_requests = raw_skip_off_hours not in {"0", "false", "False"}
 
         LOGGER.info(
-            "quote provider selected provider=ifind has_access_token=%s has_refresh_token=%s request_timeout=%s",
+            "quote provider selected provider=ifind has_access_token=%s has_refresh_token=%s request_timeout=%s skip_off_hours_requests=%s",
             bool(access_token),
             bool(refresh_token),
             request_timeout,
+            skip_off_hours_requests,
         )
         return AStockQuoteSubscriptionService(
             batch_fetcher=IFindQuoteBatchFetcher(
                 access_token=access_token,
                 refresh_token=refresh_token,
                 request_timeout=request_timeout,
+                skip_off_hours_requests=skip_off_hours_requests,
             ),
             fallback_fetchers=[],
             poll_interval=poll_interval,
+            suppress_duplicate=False,
         )
 
     raise ValueError(

@@ -5,6 +5,7 @@ Date: 2026/3/25 15:30
 Desc: iFinD 行情适配测试
 """
 
+from datetime import datetime
 import importlib.util
 import os
 import sys
@@ -104,7 +105,7 @@ def test_ifind_batch_fetcher_refreshes_token_and_maps_change_ratio():
                         {
                             "thscode": "300033.SZ",
                             "time": ["2026-03-25 15:05:15"],
-                            "table": {"changeRatio": [1.23]},
+                            "table": {"latest": [311.55], "changeRatio": [1.23]},
                         }
                     ],
                 },
@@ -116,6 +117,7 @@ def test_ifind_batch_fetcher_refreshes_token_and_maps_change_ratio():
         refresh_token="refresh-token",
         request_timeout=5,
         session=session,
+        now_func=lambda: datetime(2026, 3, 25, 14, 30, 0),
     )
 
     result = fetcher(["300033"])
@@ -124,11 +126,85 @@ def test_ifind_batch_fetcher_refreshes_token_and_maps_change_ratio():
     raw = dict(result["300033"].itertuples(index=False, name=None))
     assert raw["代码"] == "300033"
     assert raw["iFinD代码"] == "300033.SZ"
+    assert raw["最新"] == 311.55
+    assert raw["涨跌"] == raw["最新"] - raw["昨收"]
     assert raw["涨幅"] == 1.23
     assert raw["时间"] == "2026-03-25 15:05:15"
     assert session.calls[0]["url"].endswith("/get_access_token")
     assert session.calls[1]["url"].endswith("/real_time_quotation")
     assert session.calls[1]["headers"]["access_token"] == "new-access-token"
+
+
+def test_ifind_batch_fetcher_uses_cached_frames_off_hours():
+    trading_time = datetime(2026, 3, 25, 14, 30, 0)
+    off_hours_time = datetime(2026, 3, 25, 20, 0, 0)
+    current_time = {"value": trading_time}
+    session = _FakeSession(
+        responses=[
+            _FakeResponse(
+                200,
+                {
+                    "errorcode": 0,
+                    "errmsg": "Success!",
+                    "tables": [
+                        {
+                            "thscode": "300033.SZ",
+                            "time": ["2026-03-25 14:30:00"],
+                            "table": {"latest": [311.55], "changeRatio": [1.23]},
+                        }
+                    ],
+                },
+            )
+        ]
+    )
+    fetcher = IFindQuoteBatchFetcher(
+        access_token="access-token",
+        request_timeout=5,
+        session=session,
+        now_func=lambda: current_time["value"],
+    )
+
+    first_result = fetcher(["300033"])
+    current_time["value"] = off_hours_time
+    second_result = fetcher(["300033"])
+
+    assert len(session.calls) == 1
+    assert dict(first_result["300033"].itertuples(index=False, name=None)) == dict(
+        second_result["300033"].itertuples(index=False, name=None)
+    )
+
+
+def test_ifind_batch_fetcher_bootstraps_missing_symbol_off_hours():
+    session = _FakeSession(
+        responses=[
+            _FakeResponse(
+                200,
+                {
+                    "errorcode": 0,
+                    "errmsg": "Success!",
+                    "tables": [
+                        {
+                            "thscode": "300033.SZ",
+                            "time": ["2026-03-25 20:00:00"],
+                            "table": {"latest": [311.55], "changeRatio": [1.23]},
+                        }
+                    ],
+                },
+            )
+        ]
+    )
+    fetcher = IFindQuoteBatchFetcher(
+        access_token="access-token",
+        request_timeout=5,
+        session=session,
+        now_func=lambda: datetime(2026, 3, 25, 20, 0, 0),
+    )
+
+    result = fetcher(["300033"])
+
+    assert list(result) == ["300033"]
+    assert len(session.calls) == 1
+    assert session.calls[0]["json"]["codes"] == "300033.SZ"
 
 
 def test_create_default_quote_service_supports_ifind_provider():
@@ -137,13 +213,23 @@ def test_create_default_quote_service_supports_ifind_provider():
         "IFIND_ACCESS_TOKEN": os.environ.get("IFIND_ACCESS_TOKEN"),
         "IFIND_REFRESH_TOKEN": os.environ.get("IFIND_REFRESH_TOKEN"),
         "IFIND_REQUEST_TIMEOUT": os.environ.get("IFIND_REQUEST_TIMEOUT"),
+        "IFIND_SKIP_OFF_HOURS_REQUESTS": os.environ.get(
+            "IFIND_SKIP_OFF_HOURS_REQUESTS"
+        ),
     }
 
     class _FakeIFindQuoteBatchFetcher:
-        def __init__(self, access_token, refresh_token, request_timeout):
+        def __init__(
+            self,
+            access_token,
+            refresh_token,
+            request_timeout,
+            skip_off_hours_requests,
+        ):
             self.access_token = access_token
             self.refresh_token = refresh_token
             self.request_timeout = request_timeout
+            self.skip_off_hours_requests = skip_off_hours_requests
 
     fake_module = types.ModuleType("akshare.service.quote_ifind")
     fake_module.IFindQuoteBatchFetcher = _FakeIFindQuoteBatchFetcher
@@ -155,6 +241,7 @@ def test_create_default_quote_service_supports_ifind_provider():
         os.environ["IFIND_ACCESS_TOKEN"] = "access-token"
         os.environ["IFIND_REFRESH_TOKEN"] = "refresh-token"
         os.environ["IFIND_REQUEST_TIMEOUT"] = "8"
+        os.environ["IFIND_SKIP_OFF_HOURS_REQUESTS"] = "1"
 
         service = QUOTE_WEBSOCKET_MODULE._create_default_quote_service(3.0)
 
@@ -162,7 +249,9 @@ def test_create_default_quote_service_supports_ifind_provider():
         assert service._batch_fetcher.access_token == "access-token"
         assert service._batch_fetcher.refresh_token == "refresh-token"
         assert service._batch_fetcher.request_timeout == 8.0
+        assert service._batch_fetcher.skip_off_hours_requests is True
         assert service._fallback_fetchers == []
+        assert service._suppress_duplicate is False
     finally:
         if original_module is not None:
             sys.modules["akshare.service.quote_ifind"] = original_module

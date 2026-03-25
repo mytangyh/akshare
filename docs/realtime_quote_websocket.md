@@ -67,6 +67,7 @@
 | `IFIND_ACCESS_TOKEN` | 空 | iFinD access token |
 | `IFIND_REFRESH_TOKEN` | 空 | iFinD refresh token，用于自动刷新 access token |
 | `IFIND_REQUEST_TIMEOUT` | `10` | iFinD HTTP 请求超时，单位秒 |
+| `IFIND_SKIP_OFF_HOURS_REQUESTS` | `1` | 北京时间非交易时段是否跳过 iFinD 请求 |
 | `PIP_INDEX_URL` | `https://mirrors.aliyun.com/pypi/simple/` | Python 包安装镜像源 |
 | `PIP_TRUSTED_HOST` | `mirrors.aliyun.com` | Python 包安装可信主机 |
 
@@ -100,9 +101,11 @@ docker-compose up -d --build
 当 `QUOTE_PROVIDER=ifind` 时：
 
 - 服务端会调用同花顺 QuantAPI 的 HTTP 接口
-- 当前实现仅请求 `changeRatio` 字段，并映射为推送消息中的 `change_pct`
+- 当前实现请求 `latest,changeRatio`，分别映射为 `price` 和 `change_pct`
 - 需要至少提供 `IFIND_ACCESS_TOKEN` 或 `IFIND_REFRESH_TOKEN`
 - 如果同时提供 `IFIND_REFRESH_TOKEN`，服务会在 access token 失效时自动尝试刷新
+- 默认在北京时间非交易时段优先跳过 iFinD 请求，并继续按轮询间隔推送缓存快照
+- 如果服务在非交易时段遇到未命中的缓存股票，会补一次请求用于初始化缓存
 
 示例：
 
@@ -397,9 +400,12 @@ docker-compose restart
 当 `QUOTE_PROVIDER=ifind` 时：
 
 1. 使用 QuantAPI `real_time_quotation` 批量拉取已订阅代码
-2. 当前仅请求 `changeRatio`
-3. 推送消息中的 `change_pct` 来自 iFinD 的 `changeRatio`
-4. 默认不再附加东方财富/雪球网页兜底
+2. 当前请求 `latest,changeRatio`
+3. 推送消息中的 `price` 来自 iFinD 的 `latest`
+4. 推送消息中的 `change_pct` 来自 iFinD 的 `changeRatio`
+5. 北京时间非交易时段默认优先复用缓存，不重复请求 iFinD
+6. 如果订阅股票在缓存中不存在，会补一次请求初始化缓存
+7. 默认不再附加东方财富/雪球网页兜底
 
 ## 对其他 AI 的使用建议
 

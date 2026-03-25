@@ -7,10 +7,12 @@ Desc: iFinD HTTP 行情抓取适配
 
 from __future__ import annotations
 
+from datetime import datetime, time as dt_time
 import logging
 import os
 import threading
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -38,7 +40,12 @@ class IFindQuoteBatchFetcher:
 
     _QUOTE_URL = "https://quantapi.51ifind.com/api/v1/real_time_quotation"
     _REFRESH_URL = "https://quantapi.51ifind.com/api/v1/get_access_token"
-    _INDICATORS = "changeRatio"
+    _INDICATORS = "latest,changeRatio"
+    _BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+    _TRADING_SESSIONS = (
+        (dt_time(9, 30), dt_time(11, 30)),
+        (dt_time(13, 0), dt_time(15, 0)),
+    )
 
     def __init__(
         self,
@@ -46,13 +53,18 @@ class IFindQuoteBatchFetcher:
         refresh_token: str | None = None,
         request_timeout: float = 10.0,
         session: requests.Session | None = None,
+        skip_off_hours_requests: bool = True,
+        now_func=None,
     ) -> None:
         self._access_token = (access_token or "").strip()
         self._refresh_token = (refresh_token or "").strip()
         self._request_timeout = request_timeout
         self._session = session or requests.Session()
         self._owns_session = session is None
+        self._skip_off_hours_requests = skip_off_hours_requests
+        self._now_func = now_func or self._default_now
         self._lock = threading.Lock()
+        self._latest_frames: dict[str, pd.DataFrame] = {}
 
         if not self._access_token and not self._refresh_token:
             raise ValueError(
@@ -63,20 +75,52 @@ class IFindQuoteBatchFetcher:
         if not symbols:
             return {}
 
+        normalized_symbols = [self._normalize_symbol(symbol) for symbol in symbols]
+        cached_frames: dict[str, pd.DataFrame] = {}
+        request_symbols = normalized_symbols
         with self._lock:
+            if self._skip_off_hours_requests and not self._is_trading_time(
+                current_time=self._now_func()
+            ):
+                cached_frames = self._get_cached_frames(normalized_symbols)
+                request_symbols = [
+                    symbol for symbol in normalized_symbols if symbol not in cached_frames
+                ]
+                if not request_symbols:
+                    LOGGER.info(
+                        "ifind quote request skipped reason=off_hours symbols=%s cached=%s",
+                        ",".join(normalized_symbols),
+                        len(cached_frames),
+                    )
+                    return cached_frames
+                LOGGER.info(
+                    "ifind quote request reduced reason=off_hours cached=%s missing_symbols=%s",
+                    len(cached_frames),
+                    ",".join(request_symbols),
+                )
+
             access_token = self._ensure_access_token()
             payload = {
-                "codes": ",".join(self._to_ifind_code(symbol) for symbol in symbols),
+                "codes": ",".join(self._to_ifind_code(symbol) for symbol in request_symbols),
                 "indicators": self._INDICATORS,
             }
             body = self._request_quote(payload=payload, access_token=access_token)
 
-        quote_frames: dict[str, pd.DataFrame] = {}
+        quote_frames = {
+            symbol: quote_df.copy(deep=True) for symbol, quote_df in cached_frames.items()
+        }
         for item in body.get("tables", []):
             symbol = self._from_ifind_code(str(item.get("thscode", "")))
             quote_df = self._table_to_quote_df(symbol=symbol, item=item)
             if not quote_df.empty:
                 quote_frames[symbol] = quote_df
+        with self._lock:
+            self._latest_frames.update(
+                {
+                    symbol: quote_df.copy(deep=True)
+                    for symbol, quote_df in quote_frames.items()
+                }
+            )
         return quote_frames
 
     def close(self) -> None:
@@ -167,16 +211,63 @@ class IFindQuoteBatchFetcher:
     def _table_to_quote_df(cls, symbol: str, item: dict[str, Any]) -> pd.DataFrame:
         table = item.get("table", {}) or {}
         source_time = cls._extract_first(item.get("time"))
+        latest_price = cls._to_float(cls._extract_first(table.get("latest")))
+        change_pct = cls._to_float(cls._extract_first(table.get("changeRatio")))
+        prev_close = cls._infer_prev_close(
+            latest_price=latest_price,
+            change_pct=change_pct,
+        )
+        change = None
+        if latest_price is not None and prev_close is not None:
+            change = latest_price - prev_close
         raw = {
             "代码": symbol,
             "iFinD代码": cls._to_text(item.get("thscode")),
-            "涨幅": cls._to_float(cls._extract_first(table.get("changeRatio"))),
+            "最新": latest_price,
+            "涨跌": change,
+            "昨收": prev_close,
+            "涨幅": change_pct,
             "时间": cls._to_text(source_time),
         }
         normalized_raw = {
             key: value for key, value in raw.items() if value is not None and value != ""
         }
         return pd.DataFrame(list(normalized_raw.items()), columns=["item", "value"])
+
+    def _get_cached_frames(self, symbols: list[str]) -> dict[str, pd.DataFrame]:
+        return {
+            symbol: self._latest_frames[symbol].copy(deep=True)
+            for symbol in symbols
+            if symbol in self._latest_frames
+        }
+
+    @classmethod
+    def _is_trading_time(cls, current_time: datetime) -> bool:
+        if current_time.tzinfo is None:
+            beijing_now = current_time.replace(tzinfo=cls._BEIJING_TZ)
+        else:
+            beijing_now = current_time.astimezone(cls._BEIJING_TZ)
+        if beijing_now.weekday() >= 5:
+            return False
+        current_clock = beijing_now.time().replace(tzinfo=None)
+        return any(
+            start <= current_clock < end for start, end in cls._TRADING_SESSIONS
+        )
+
+    @classmethod
+    def _default_now(cls) -> datetime:
+        return datetime.now(cls._BEIJING_TZ)
+
+    @staticmethod
+    def _infer_prev_close(
+        latest_price: float | None, change_pct: float | None
+    ) -> float | None:
+        if latest_price is None or change_pct is None:
+            return None
+        denominator = 1 + change_pct / 100
+        if denominator == 0:
+            return None
+        return latest_price / denominator
 
     @staticmethod
     def _extract_first(value: Any) -> Any:
