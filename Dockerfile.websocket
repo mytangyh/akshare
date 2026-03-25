@@ -12,7 +12,7 @@ RUN pip install --upgrade pip -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_H
 
 COPY pyproject.toml setup.py README.md ./
 COPY akshare ./akshare
-RUN pip install ".[realtime]" -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST}
+RUN pip install ".[realtime,futu]" -i ${PIP_INDEX_URL} --trusted-host ${PIP_TRUSTED_HOST}
 
 COPY app ./app
 

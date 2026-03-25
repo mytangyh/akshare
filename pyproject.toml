@@ -65,6 +65,9 @@ realtime = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
 ]
+futu = [
+    "futu-api>=9.4.5408",
+]
 dev = [
     "akqmt>=0.1.0",
     "commitizen>=4.12.1; python_version >= '3.10'",

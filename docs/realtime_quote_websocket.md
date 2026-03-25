@@ -12,6 +12,7 @@
 - 支持取消订阅
 - 支持同一连接内多股票订阅
 - 服务端汇总全部活跃股票代码后统一轮询，避免重复请求上游
+- 支持通过环境变量切换行情源提供方
 - 上游失败时自动切换备用数据源
 - 行情未变化时默认不重复推送
 
@@ -51,16 +52,45 @@
 - 默认宿主机映射端口: `8000:8000`
 - 重启策略: `unless-stopped`
 - 健康检查地址: `http://127.0.0.1:8000/healthz`
+- 已配置 `host.docker.internal:host-gateway`，便于容器访问宿主机上的 OpenD
 
 ### 可配置环境变量
 
 | 环境变量 | 默认值 | 含义 |
 | --- | --- | --- |
+| `QUOTE_PROVIDER` | `default` | 行情源提供方，当前支持 `default`、`web`、`futu` |
 | `QUOTE_POLL_INTERVAL` | `3.0` | 行情轮询基础间隔，单位秒 |
 | `QUOTE_LOG_LEVEL` | `INFO` | 服务日志级别 |
 | `QUOTE_SERVICE_PORT` | `8000` | 宿主机暴露端口 |
+| `FUTU_OPEND_HOST` | `host.docker.internal` | Futu OpenD 地址 |
+| `FUTU_OPEND_PORT` | `11111` | Futu OpenD 端口 |
 | `PIP_INDEX_URL` | `https://mirrors.aliyun.com/pypi/simple/` | Python 包安装镜像源 |
 | `PIP_TRUSTED_HOST` | `mirrors.aliyun.com` | Python 包安装可信主机 |
+
+### Futu 模式部署要求
+
+当 `QUOTE_PROVIDER=futu` 时：
+
+- 服务端不再使用东方财富/雪球作为默认源
+- 服务会通过 `futu-api` 连接外部 OpenD
+- 需要提前启动并登录 OpenD
+- 容器必须能访问 `FUTU_OPEND_HOST:FUTU_OPEND_PORT`
+
+推荐部署方式：
+
+1. 在宿主机或另一台内网机器上启动 OpenD。
+2. 设置 `QUOTE_PROVIDER=futu`。
+3. 设置 `FUTU_OPEND_HOST` 和 `FUTU_OPEND_PORT`。
+4. 执行 `docker-compose up -d --build`。
+
+示例：
+
+```shell
+export QUOTE_PROVIDER=futu
+export FUTU_OPEND_HOST=host.docker.internal
+export FUTU_OPEND_PORT=11111
+docker-compose up -d --build
+```
 
 ### 镜像入口
 
@@ -275,6 +305,28 @@ docker-compose restart
 - `涨停`
 - `跌停`
 
+### Futu 源中的常见字段
+
+当 `QUOTE_PROVIDER=futu` 时，`raw` 通常会包含:
+
+- `代码`
+- `Futu代码`
+- `名称`
+- `最新`
+- `涨跌`
+- `涨幅`
+- `总手`
+- `金额`
+- `今开`
+- `最高`
+- `最低`
+- `昨收`
+- `换手`
+- `振幅`
+- `时间`
+- `停牌`
+- `状态`
+
 ## 服务端轮询逻辑
 
 当前默认行为:
@@ -297,6 +349,8 @@ docker-compose restart
 
 ## 上游数据源优先级
 
+### 默认模式
+
 当前顺序如下:
 
 1. 东方财富批量接口
@@ -309,6 +363,14 @@ docker-compose restart
 - 个别股票在批量返回缺失时，才会走单股兜底
 - `raw` 字段内容会随实际命中的数据源不同而变化
 
+### Futu 模式
+
+当 `QUOTE_PROVIDER=futu` 时：
+
+1. 使用 Futu OpenAPI `subscribe(..., QUOTE)` 订阅所需代码
+2. 使用 `get_stock_quote(...)` 批量拉取已订阅报价
+3. 默认不再附加东方财富/雪球网页兜底
+
 ## 对其他 AI 的使用建议
 
 - 先判断消息的 `type`
@@ -318,6 +380,7 @@ docker-compose restart
 - 不要假设所有行情消息都按固定 3 秒严格到达
 - 服务端默认会做去重，所以行情不变化时可能不会推送新消息
 - 如果需要盘口五档、市盈率、量比、均价等扩展字段，应先检查 `raw`
+- 如果部署在云服务器且网页源被风控，优先考虑 `QUOTE_PROVIDER=futu`
 
 ## 当前实现边界
 
@@ -331,5 +394,6 @@ docker-compose restart
 
 - WebSocket 入口: `akshare/service/quote_websocket.py`
 - 订阅与轮询核心: `akshare/service/quote_subscription.py`
+- Futu 行情源: `akshare/service/quote_futu.py`
 - 东方财富单股源: `akshare/stock/stock_ask_bid_em.py`
 - 雪球个股源: `akshare/stock/stock_xq.py`

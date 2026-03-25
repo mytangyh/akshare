@@ -30,6 +30,42 @@ LOGGER.setLevel(
 )
 
 
+def _create_default_quote_service(
+    poll_interval: float,
+) -> AStockQuoteSubscriptionService:
+    provider = os.getenv("QUOTE_PROVIDER", "default").strip().lower()
+    if provider in {"default", "web"}:
+        LOGGER.info("quote provider selected provider=%s", provider)
+        return AStockQuoteSubscriptionService(poll_interval=poll_interval)
+
+    if provider == "futu":
+        from .quote_futu import FutuQuoteBatchFetcher
+
+        host = os.getenv("FUTU_OPEND_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        raw_port = os.getenv("FUTU_OPEND_PORT", "11111")
+        try:
+            port = int(raw_port)
+        except ValueError as err:
+            raise ValueError("FUTU_OPEND_PORT 必须是整数") from err
+        if port <= 0:
+            raise ValueError("FUTU_OPEND_PORT 必须大于 0")
+
+        LOGGER.info(
+            "quote provider selected provider=futu host=%s port=%s",
+            host,
+            port,
+        )
+        return AStockQuoteSubscriptionService(
+            batch_fetcher=FutuQuoteBatchFetcher(host=host, port=port),
+            fallback_fetchers=[],
+            poll_interval=poll_interval,
+        )
+
+    raise ValueError(
+        "QUOTE_PROVIDER 仅支持 default、web、futu"
+    )
+
+
 def create_quote_websocket_app(
     service: AStockQuoteSubscriptionService | None = None,
     poll_interval: float = 3.0,
@@ -40,7 +76,7 @@ def create_quote_websocket_app(
 
     FastAPI, WebSocket, WebSocketDisconnect = _load_fastapi()
 
-    quote_service = service or AStockQuoteSubscriptionService(
+    quote_service = service or _create_default_quote_service(
         poll_interval=poll_interval
     )
 

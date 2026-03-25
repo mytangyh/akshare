@@ -140,6 +140,7 @@ class AStockQuoteSubscriptionService:
         elif fetcher is not None:
             fallback_fetchers = [fetcher, *fallback_fetchers]
         self._fallback_fetchers = fallback_fetchers
+        self._resource_closers = self._collect_resource_closers()
 
         self._lock = asyncio.Lock()
         self._subscribers_by_symbol: dict[
@@ -338,6 +339,8 @@ class AStockQuoteSubscriptionService:
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+        await self._close_resource_closers()
 
         LOGGER.info(
             "quote service stopped cleared_subscriptions=%s cleared_symbols=%s",
@@ -558,6 +561,28 @@ class AStockQuoteSubscriptionService:
             return {symbol: fetcher(symbol) for symbol in symbols}
 
         return inner
+
+    def _collect_resource_closers(self) -> list[Callable[[], Any]]:
+        closers: list[Callable[[], Any]] = []
+        seen_ids: set[int] = set()
+
+        for fetcher in [self._batch_fetcher, *self._fallback_fetchers]:
+            closer = getattr(fetcher, "close", None)
+            if closer is None or not callable(closer):
+                continue
+            fetcher_id = id(fetcher)
+            if fetcher_id in seen_ids:
+                continue
+            seen_ids.add(fetcher_id)
+            closers.append(closer)
+        return closers
+
+    async def _close_resource_closers(self) -> None:
+        for closer in self._resource_closers:
+            try:
+                await asyncio.to_thread(closer)
+            except Exception as err:  # noqa: PERF203
+                LOGGER.warning("quote fetcher close failed error=%s", err)
 
     @staticmethod
     def _fetcher_name(fetcher: QuoteFetcher) -> str:
