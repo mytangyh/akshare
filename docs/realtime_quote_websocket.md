@@ -58,12 +58,15 @@
 
 | 环境变量 | 默认值 | 含义 |
 | --- | --- | --- |
-| `QUOTE_PROVIDER` | `default` | 行情源提供方，当前支持 `default`、`web`、`futu` |
+| `QUOTE_PROVIDER` | `default` | 行情源提供方，当前支持 `default`、`web`、`futu`、`ifind` |
 | `QUOTE_POLL_INTERVAL` | `3.0` | 行情轮询基础间隔，单位秒 |
 | `QUOTE_LOG_LEVEL` | `INFO` | 服务日志级别 |
 | `QUOTE_SERVICE_PORT` | `8000` | 宿主机暴露端口 |
 | `FUTU_OPEND_HOST` | `host.docker.internal` | Futu OpenD 地址 |
 | `FUTU_OPEND_PORT` | `11111` | Futu OpenD 端口 |
+| `IFIND_ACCESS_TOKEN` | 空 | iFinD access token |
+| `IFIND_REFRESH_TOKEN` | 空 | iFinD refresh token，用于自动刷新 access token |
+| `IFIND_REQUEST_TIMEOUT` | `10` | iFinD HTTP 请求超时，单位秒 |
 | `PIP_INDEX_URL` | `https://mirrors.aliyun.com/pypi/simple/` | Python 包安装镜像源 |
 | `PIP_TRUSTED_HOST` | `mirrors.aliyun.com` | Python 包安装可信主机 |
 
@@ -89,6 +92,24 @@
 export QUOTE_PROVIDER=futu
 export FUTU_OPEND_HOST=host.docker.internal
 export FUTU_OPEND_PORT=11111
+docker-compose up -d --build
+```
+
+### iFinD 模式部署要求
+
+当 `QUOTE_PROVIDER=ifind` 时：
+
+- 服务端会调用同花顺 QuantAPI 的 HTTP 接口
+- 当前实现仅请求 `changeRatio` 字段，并映射为推送消息中的 `change_pct`
+- 需要至少提供 `IFIND_ACCESS_TOKEN` 或 `IFIND_REFRESH_TOKEN`
+- 如果同时提供 `IFIND_REFRESH_TOKEN`，服务会在 access token 失效时自动尝试刷新
+
+示例：
+
+```shell
+export QUOTE_PROVIDER=ifind
+export IFIND_ACCESS_TOKEN=your_access_token
+export IFIND_REFRESH_TOKEN=your_refresh_token
 docker-compose up -d --build
 ```
 
@@ -371,6 +392,15 @@ docker-compose restart
 2. 使用 `get_stock_quote(...)` 批量拉取已订阅报价
 3. 默认不再附加东方财富/雪球网页兜底
 
+### iFinD 模式
+
+当 `QUOTE_PROVIDER=ifind` 时：
+
+1. 使用 QuantAPI `real_time_quotation` 批量拉取已订阅代码
+2. 当前仅请求 `changeRatio`
+3. 推送消息中的 `change_pct` 来自 iFinD 的 `changeRatio`
+4. 默认不再附加东方财富/雪球网页兜底
+
 ## 对其他 AI 的使用建议
 
 - 先判断消息的 `type`
@@ -381,6 +411,7 @@ docker-compose restart
 - 服务端默认会做去重，所以行情不变化时可能不会推送新消息
 - 如果需要盘口五档、市盈率、量比、均价等扩展字段，应先检查 `raw`
 - 如果部署在云服务器且网页源被风控，优先考虑 `QUOTE_PROVIDER=futu`
+- 如果只需要涨跌幅字段，且已具备 QuantAPI token，可考虑 `QUOTE_PROVIDER=ifind`
 
 ## 当前实现边界
 
@@ -395,5 +426,6 @@ docker-compose restart
 - WebSocket 入口: `akshare/service/quote_websocket.py`
 - 订阅与轮询核心: `akshare/service/quote_subscription.py`
 - Futu 行情源: `akshare/service/quote_futu.py`
+- iFinD 行情源: `akshare/service/quote_ifind.py`
 - 东方财富单股源: `akshare/stock/stock_ask_bid_em.py`
 - 雪球个股源: `akshare/stock/stock_xq.py`

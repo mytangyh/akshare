@@ -16,6 +16,8 @@ MANIFEST
 # --- Virtual Environments ---
 # Common venv naming conventions
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
@@ -37,6 +39,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 htmlcov/
+.codex-tmp/
 
 # --- Type Checking ---
 .mypy_cache/

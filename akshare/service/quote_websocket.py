@@ -61,8 +61,37 @@ def _create_default_quote_service(
             poll_interval=poll_interval,
         )
 
+    if provider == "ifind":
+        from .quote_ifind import IFindQuoteBatchFetcher
+
+        access_token = os.getenv("IFIND_ACCESS_TOKEN", "").strip()
+        refresh_token = os.getenv("IFIND_REFRESH_TOKEN", "").strip()
+        raw_timeout = os.getenv("IFIND_REQUEST_TIMEOUT", "10")
+        try:
+            request_timeout = float(raw_timeout)
+        except ValueError as err:
+            raise ValueError("IFIND_REQUEST_TIMEOUT 必须是数字") from err
+        if request_timeout <= 0:
+            raise ValueError("IFIND_REQUEST_TIMEOUT 必须大于 0")
+
+        LOGGER.info(
+            "quote provider selected provider=ifind has_access_token=%s has_refresh_token=%s request_timeout=%s",
+            bool(access_token),
+            bool(refresh_token),
+            request_timeout,
+        )
+        return AStockQuoteSubscriptionService(
+            batch_fetcher=IFindQuoteBatchFetcher(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                request_timeout=request_timeout,
+            ),
+            fallback_fetchers=[],
+            poll_interval=poll_interval,
+        )
+
     raise ValueError(
-        "QUOTE_PROVIDER 仅支持 default、web、futu"
+        "QUOTE_PROVIDER 仅支持 default、web、futu、ifind"
     )
 
 
