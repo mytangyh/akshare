@@ -8,12 +8,16 @@ Desc: A 股实时行情 WebSocket 接口
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+from datetime import datetime, time as dt_time, timedelta
 import logging
 import os
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
+from .ifind_minute_series import IFindMinuteSeriesService, MinuteSeriesSnapshot
 from .quote_subscription import AStockQuoteSubscriptionService, QuoteSnapshot
 
 LOGGER = logging.getLogger(__name__)
@@ -28,6 +32,16 @@ if not LOGGER.handlers:
 LOGGER.setLevel(
     getattr(logging, os.getenv("QUOTE_LOG_LEVEL", "INFO").upper(), logging.INFO)
 )
+
+_OUTGOING_QUEUE_MAXSIZE = 1000
+_BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+
+
+@dataclass(frozen=True)
+class _MinuteSeriesLiveHandle:
+    subscription_id: str
+    symbol: str
+    task: asyncio.Task[None]
 
 
 def _create_default_quote_service(
@@ -100,8 +114,41 @@ def _create_default_quote_service(
     )
 
 
+def _create_default_minute_series_service() -> IFindMinuteSeriesService | None:
+    provider = os.getenv("QUOTE_PROVIDER", "default").strip().lower()
+    if provider != "ifind":
+        LOGGER.info(
+            "minute series service disabled provider=%s reason=provider_not_ifind",
+            provider,
+        )
+        return None
+
+    access_token = os.getenv("IFIND_ACCESS_TOKEN", "").strip()
+    refresh_token = os.getenv("IFIND_REFRESH_TOKEN", "").strip()
+    raw_timeout = os.getenv("IFIND_REQUEST_TIMEOUT", "10")
+    try:
+        request_timeout = float(raw_timeout)
+    except ValueError as err:
+        raise ValueError("IFIND_REQUEST_TIMEOUT 必须是数字") from err
+    if request_timeout <= 0:
+        raise ValueError("IFIND_REQUEST_TIMEOUT 必须大于 0")
+
+    LOGGER.info(
+        "minute series service enabled provider=ifind has_access_token=%s has_refresh_token=%s request_timeout=%s",
+        bool(access_token),
+        bool(refresh_token),
+        request_timeout,
+    )
+    return IFindMinuteSeriesService(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        request_timeout=request_timeout,
+    )
+
+
 def create_quote_websocket_app(
     service: AStockQuoteSubscriptionService | None = None,
+    minute_series_service: IFindMinuteSeriesService | None = None,
     poll_interval: float = 3.0,
 ):
     """
@@ -113,6 +160,7 @@ def create_quote_websocket_app(
     quote_service = service or _create_default_quote_service(
         poll_interval=poll_interval
     )
+    minute_series_service = minute_series_service or _create_default_minute_series_service()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -125,6 +173,8 @@ def create_quote_websocket_app(
         finally:
             LOGGER.info("quote websocket app stopping")
             await quote_service.stop()
+            if minute_series_service is not None:
+                await minute_series_service.stop()
             LOGGER.info("quote websocket app stopped")
 
     app = FastAPI(
@@ -133,6 +183,7 @@ def create_quote_websocket_app(
         lifespan=lifespan,
     )
     app.state.quote_service = quote_service
+    app.state.minute_series_service = minute_series_service
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -140,6 +191,7 @@ def create_quote_websocket_app(
             "status": "ok",
             "active_symbols": list(quote_service.active_symbols),
             "subscriptions": quote_service.subscription_size,
+            "minute_series_enabled": minute_series_service is not None,
         }
 
     @app.websocket("/ws/quotes")
@@ -152,7 +204,9 @@ def create_quote_websocket_app(
             connection_id,
             client,
         )
-        outgoing_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        outgoing_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=_OUTGOING_QUEUE_MAXSIZE
+        )
         sender_task = asyncio.create_task(
             _sender_loop(
                 websocket=websocket,
@@ -163,10 +217,23 @@ def create_quote_websocket_app(
         )
         subscriptions_by_symbol: dict[str, Any] = {}
         forwarders_by_symbol: dict[str, asyncio.Task[None]] = {}
+        minute_series_live_handles: dict[str, _MinuteSeriesLiveHandle] = {}
+        minute_series_subscription_index: dict[str, str] = {}
 
         try:
             while True:
-                payload = await websocket.receive_json()
+                receive_task = asyncio.create_task(websocket.receive_json())
+                done, _ = await asyncio.wait(
+                    {receive_task, sender_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if sender_task in done:
+                    receive_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await receive_task
+                    break
+
+                payload = await receive_task
                 LOGGER.info(
                     "websocket request received connection_id=%s client=%s payload=%s",
                     connection_id,
@@ -191,13 +258,14 @@ def create_quote_websocket_app(
                                 normalized_symbol,
                                 current_subscription.subscription_id,
                             )
-                            await outgoing_queue.put(
+                            _offer_message(
+                                outgoing_queue,
                                 {
                                     "type": "subscribed",
                                     "symbol": normalized_symbol,
                                     "subscription_id": current_subscription.subscription_id,
                                     "reused": True,
-                                }
+                                },
                             )
                             continue
 
@@ -211,13 +279,14 @@ def create_quote_websocket_app(
                             subscription.subscription_id,
                             len(subscriptions_by_symbol),
                         )
-                        await outgoing_queue.put(
+                        _offer_message(
+                            outgoing_queue,
                             {
                                 "type": "subscribed",
                                 "symbol": normalized_symbol,
                                 "subscription_id": subscription.subscription_id,
                                 "reused": False,
-                            }
+                            },
                         )
                         forwarders_by_symbol[normalized_symbol] = asyncio.create_task(
                             _forward_subscription(
@@ -243,7 +312,83 @@ def create_quote_websocket_app(
                             result.get("removed"),
                             len(subscriptions_by_symbol),
                         )
-                        await outgoing_queue.put(result)
+                        _offer_message(outgoing_queue, result)
+                        continue
+
+                    if action == "subscribe_minute_series":
+                        if minute_series_service is None:
+                            raise ValueError(
+                                "当前 QUOTE_PROVIDER 不支持分钟序列订阅，仅 ifind 可用"
+                            )
+                        raw_timestamp = payload.get("timestamp")
+                        if not raw_timestamp:
+                            raise ValueError(
+                                "subscribe_minute_series requires timestamp"
+                            )
+                        normalized_symbol = minute_series_service.normalize_symbol(
+                            payload.get("symbol")
+                        )
+                        current_handle = minute_series_live_handles.get(normalized_symbol)
+                        if current_handle is not None:
+                            await _unsubscribe_minute_series_symbol(
+                                symbol=normalized_symbol,
+                                live_handles_by_symbol=minute_series_live_handles,
+                                subscription_index=minute_series_subscription_index,
+                            )
+
+                        snapshot = await minute_series_service.get_snapshot(
+                            symbol=normalized_symbol,
+                            request_timestamp=str(raw_timestamp),
+                        )
+                        subscription_id = None
+                        if snapshot.live:
+                            subscription_id = uuid4().hex
+                            task = asyncio.create_task(
+                                _forward_minute_series(
+                                    symbol=normalized_symbol,
+                                    subscription_id=subscription_id,
+                                    minute_series_service=minute_series_service,
+                                    outgoing_queue=outgoing_queue,
+                                    initial_last_timestamp=snapshot.last_timestamp,
+                                )
+                            )
+                            minute_series_live_handles[normalized_symbol] = (
+                                _MinuteSeriesLiveHandle(
+                                    subscription_id=subscription_id,
+                                    symbol=normalized_symbol,
+                                    task=task,
+                                )
+                            )
+                            minute_series_subscription_index[subscription_id] = (
+                                normalized_symbol
+                            )
+
+                        _offer_message(
+                            outgoing_queue,
+                            {
+                                "type": "subscribed_minute_series",
+                                "symbol": normalized_symbol,
+                                "subscription_id": subscription_id,
+                                "live": snapshot.live,
+                            },
+                        )
+                        _offer_message(
+                            outgoing_queue,
+                            _minute_series_snapshot_to_message(
+                                snapshot=snapshot,
+                                subscription_id=subscription_id,
+                            ),
+                        )
+                        continue
+
+                    if action == "unsubscribe_minute_series":
+                        result = await _unsubscribe_minute_series_by_payload(
+                            payload=payload,
+                            minute_series_service=minute_series_service,
+                            live_handles_by_symbol=minute_series_live_handles,
+                            subscription_index=minute_series_subscription_index,
+                        )
+                        _offer_message(outgoing_queue, result)
                         continue
 
                     if action == "ping":
@@ -252,7 +397,7 @@ def create_quote_websocket_app(
                             connection_id,
                             client,
                         )
-                        await outgoing_queue.put({"type": "pong"})
+                        _offer_message(outgoing_queue, {"type": "pong"})
                         continue
 
                     LOGGER.warning(
@@ -261,12 +406,19 @@ def create_quote_websocket_app(
                         client,
                         action,
                     )
-                    await outgoing_queue.put(
+                    _offer_message(
+                        outgoing_queue,
                         {
                             "type": "error",
                             "message": "unsupported action",
-                            "supported_actions": ["subscribe", "unsubscribe", "ping"],
-                        }
+                            "supported_actions": [
+                                "subscribe",
+                                "unsubscribe",
+                                "subscribe_minute_series",
+                                "unsubscribe_minute_series",
+                                "ping",
+                            ],
+                        },
                     )
                 except ValueError as err:
                     LOGGER.warning(
@@ -276,7 +428,9 @@ def create_quote_websocket_app(
                         err,
                         _summarize_payload(payload),
                     )
-                    await outgoing_queue.put({"type": "error", "message": str(err)})
+                    _offer_message(
+                        outgoing_queue, {"type": "error", "message": str(err)}
+                    )
                 except Exception:
                     LOGGER.exception(
                         "websocket request failed connection_id=%s client=%s payload=%s",
@@ -284,11 +438,12 @@ def create_quote_websocket_app(
                         client,
                         _summarize_payload(payload),
                     )
-                    await outgoing_queue.put(
+                    _offer_message(
+                        outgoing_queue,
                         {
                             "type": "error",
                             "message": "internal server error",
-                        }
+                        },
                     )
         except WebSocketDisconnect:
             LOGGER.info(
@@ -299,8 +454,7 @@ def create_quote_websocket_app(
             )
         finally:
             sender_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await sender_task
+            await asyncio.gather(sender_task, return_exceptions=True)
 
             symbols = list(subscriptions_by_symbol)
             for symbol in symbols:
@@ -309,6 +463,13 @@ def create_quote_websocket_app(
                     quote_service=quote_service,
                     subscriptions_by_symbol=subscriptions_by_symbol,
                     forwarders_by_symbol=forwarders_by_symbol,
+                )
+            minute_symbols = list(minute_series_live_handles)
+            for symbol in minute_symbols:
+                await _unsubscribe_minute_series_symbol(
+                    symbol=symbol,
+                    live_handles_by_symbol=minute_series_live_handles,
+                    subscription_index=minute_series_subscription_index,
                 )
             LOGGER.info(
                 "websocket cleanup completed connection_id=%s client=%s",
@@ -421,16 +582,133 @@ async def _forward_subscription(
     try:
         while True:
             snapshot = await subscription.queue.get()
-            await outgoing_queue.put(
+            _offer_message(
+                outgoing_queue,
                 {
                     "type": "quote",
                     "symbol": subscription.symbol,
                     "subscription_id": subscription.subscription_id,
                     "data": _snapshot_to_dict(snapshot),
-                }
+                },
             )
     except asyncio.CancelledError:
         raise
+
+
+async def _unsubscribe_minute_series_by_payload(
+    payload: dict[str, Any],
+    minute_series_service: IFindMinuteSeriesService,
+    live_handles_by_symbol: dict[str, _MinuteSeriesLiveHandle],
+    subscription_index: dict[str, str],
+) -> dict[str, Any]:
+    symbol = payload.get("symbol")
+    subscription_id = payload.get("subscription_id")
+
+    if symbol:
+        normalized_symbol = minute_series_service.normalize_symbol(symbol)
+        return await _unsubscribe_minute_series_symbol(
+            symbol=normalized_symbol,
+            live_handles_by_symbol=live_handles_by_symbol,
+            subscription_index=subscription_index,
+        )
+
+    if subscription_id:
+        current_symbol = subscription_index.get(str(subscription_id))
+        if current_symbol is None:
+            return {
+                "type": "unsubscribed_minute_series",
+                "subscription_id": subscription_id,
+                "removed": False,
+            }
+        return await _unsubscribe_minute_series_symbol(
+            symbol=current_symbol,
+            live_handles_by_symbol=live_handles_by_symbol,
+            subscription_index=subscription_index,
+        )
+
+    return {
+        "type": "error",
+        "message": "unsubscribe_minute_series requires symbol or subscription_id",
+    }
+
+
+async def _unsubscribe_minute_series_symbol(
+    symbol: str,
+    live_handles_by_symbol: dict[str, _MinuteSeriesLiveHandle],
+    subscription_index: dict[str, str],
+) -> dict[str, Any]:
+    handle = live_handles_by_symbol.pop(symbol, None)
+    if handle is None:
+        return {
+            "type": "unsubscribed_minute_series",
+            "symbol": symbol,
+            "removed": False,
+        }
+
+    subscription_index.pop(handle.subscription_id, None)
+    handle.task.cancel()
+    with suppress(asyncio.CancelledError):
+        await handle.task
+    return {
+        "type": "unsubscribed_minute_series",
+        "symbol": symbol,
+        "subscription_id": handle.subscription_id,
+        "removed": True,
+    }
+
+
+async def _forward_minute_series(
+    symbol: str,
+    subscription_id: str,
+    minute_series_service: IFindMinuteSeriesService,
+    outgoing_queue: asyncio.Queue[dict[str, Any]],
+    initial_last_timestamp: str | None,
+) -> None:
+    last_sent_timestamp = initial_last_timestamp
+    try:
+        while True:
+            await _sleep_until_next_minute_series_update(
+                now_func=minute_series_service.current_time
+            )
+            snapshot = await minute_series_service.get_live_snapshot(symbol)
+            if (
+                snapshot.last_timestamp is not None
+                and snapshot.last_timestamp != last_sent_timestamp
+            ):
+                _offer_message(
+                    outgoing_queue,
+                    _minute_series_snapshot_to_message(
+                        snapshot=snapshot,
+                        subscription_id=subscription_id,
+                    ),
+                )
+                last_sent_timestamp = snapshot.last_timestamp
+            if not snapshot.live:
+                return
+    except asyncio.CancelledError:
+        raise
+
+
+async def _sleep_until_next_minute_series_update(
+    now_func,
+) -> None:
+    now = now_func().astimezone(_BEIJING_TZ)
+    current_clock = now.time().replace(tzinfo=None)
+
+    if current_clock < dt_time(9, 30):
+        target = now.replace(hour=9, minute=30, second=2, microsecond=0)
+    elif current_clock < dt_time(11, 30):
+        next_minute = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        target = next_minute + timedelta(seconds=2)
+    elif current_clock < dt_time(13, 0):
+        target = now.replace(hour=13, minute=0, second=2, microsecond=0)
+    elif current_clock < dt_time(15, 0):
+        next_minute = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        target = next_minute + timedelta(seconds=2)
+    else:
+        target = now + timedelta(seconds=60)
+
+    await asyncio.sleep(max((target - now).total_seconds(), 0))
 
 
 async def _sender_loop(
@@ -479,6 +757,34 @@ def _snapshot_to_dict(snapshot: QuoteSnapshot) -> dict[str, Any]:
     }
 
 
+def _minute_series_snapshot_to_message(
+    snapshot: MinuteSeriesSnapshot,
+    subscription_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "type": "minute_series",
+        "symbol": snapshot.symbol,
+        "subscription_id": subscription_id,
+        "previousClose": snapshot.previous_close,
+        "points": [
+            {"timestamp": point.timestamp, "value": point.value}
+            for point in snapshot.points
+        ],
+        "live": snapshot.live,
+    }
+
+
+def _offer_message(
+    queue: asyncio.Queue[dict[str, Any]], message: dict[str, Any]
+) -> None:
+    if queue.full():
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    queue.put_nowait(message)
+
+
 def _client_repr(websocket) -> str:
     client = getattr(websocket, "client", None)
     if client is None:
@@ -495,6 +801,7 @@ def _summarize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "action": payload.get("action"),
         "symbol": payload.get("symbol"),
         "subscription_id": payload.get("subscription_id"),
+        "timestamp": payload.get("timestamp"),
     }
 
 
@@ -516,6 +823,22 @@ def _log_outgoing_message(
             data.get("price"),
             data.get("change_pct"),
             data.get("source_time"),
+        )
+        return
+
+    if message_type == "minute_series":
+        points = message.get("points") or []
+        last_timestamp = points[-1].get("timestamp") if points else None
+        LOGGER.info(
+            "websocket message sent connection_id=%s client=%s type=%s symbol=%s subscription_id=%s points=%s last_timestamp=%s previous_close=%s",
+            connection_id,
+            client,
+            message_type,
+            message.get("symbol"),
+            message.get("subscription_id"),
+            len(points),
+            last_timestamp,
+            message.get("previousClose"),
         )
         return
 
